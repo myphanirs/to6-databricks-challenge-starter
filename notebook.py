@@ -57,6 +57,27 @@ print({"input_schema": INPUT_SCHEMA, "output_schema": OUTPUT_SCHEMA})
 
 # COMMAND ----------
 
+# Catalog descriptions (table comments) and column definitions for the inputs and lineage view
+catalog_desc = spark.sql(f"""
+    SELECT table_catalog || '.' || table_schema || '.' || table_name AS full_name, table_type, comment
+    FROM training.information_schema.tables
+    WHERE table_schema = '{INPUT_SCHEMA.split('.')[1]}'
+      AND table_name IN ('returns_initial', 'returns_corrected', 'source_lineage')
+    ORDER BY table_name
+""")
+display(catalog_desc)
+display(spark.sql(f"DESCRIBE TABLE {INITIAL_TABLE}"))
+# Catalog descriptions (table comments) and column definitions for the inputs and lineage view
+
+
+# COMMAND ----------
+
+# At least three sample rows from each delivery
+display(spark.table(INITIAL_TABLE).orderBy("return_id").limit(5))
+display(spark.table(CORRECTED_TABLE).orderBy("return_id").limit(5))
+
+# COMMAND ----------
+
 # DBTITLE 1,1a. Catalog descriptions
 # Catalog descriptions (table comments) and column definitions for the inputs and lineage view
 catalog_desc = spark.sql(f"""
@@ -78,9 +99,40 @@ display(spark.table(CORRECTED_TABLE).orderBy("return_id").limit(5))
 
 # COMMAND ----------
 
+# Supplied lineage view: which upstream table each delivery was built from
+display(spark.table(LINEAGE_VIEW))
+
+# COMMAND ----------
+
 # DBTITLE 1,1c. Upstream source from lineage view
 # Supplied lineage view: which upstream table each delivery was built from
 display(spark.table(LINEAGE_VIEW))
+
+# COMMAND ----------
+
+# Profile the FULL batch (not just samples): rows, distinct IDs, missing required values,
+# duplicate return IDs, zero-income and negative-amount records, by delivery and tax year
+REQUIRED = ["return_id", "tax_year", "income", "deduction"]
+
+def profile_sql(table, label):
+    missing = " OR ".join(f"{c} IS NULL" for c in REQUIRED)
+    return f"""
+    SELECT '{label}' AS batch, tax_year,
+           COUNT(*) AS rows,
+           COUNT(DISTINCT return_id) AS distinct_return_ids,
+           COUNT(*) - COUNT(DISTINCT return_id) AS duplicate_rows,
+           SUM(CASE WHEN {missing} THEN 1 ELSE 0 END) AS rows_missing_required,
+           SUM(CASE WHEN income = 0 THEN 1 ELSE 0 END) AS zero_income,
+           SUM(CASE WHEN income < 0 OR deduction < 0 THEN 1 ELSE 0 END) AS negative_amounts
+    FROM {table} GROUP BY tax_year"""
+
+profile = spark.sql(profile_sql(INITIAL_TABLE, "initial") + " UNION ALL " + profile_sql(CORRECTED_TABLE, "corrected")).orderBy("batch", "tax_year")
+display(profile)
+
+# Return IDs appearing more than once across the whole batch (duplicates can span years)
+for label, table in [("initial", INITIAL_TABLE), ("corrected", CORRECTED_TABLE)]:
+    print(label, "- duplicate return_ids:")
+    display(spark.sql(f"SELECT return_id, COUNT(*) AS n FROM {table} GROUP BY return_id HAVING COUNT(*) > 1"))
 
 # COMMAND ----------
 
