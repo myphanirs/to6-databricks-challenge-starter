@@ -1,0 +1,4 @@
+return_id,taxpayer_id,tax_year,income,deduction,rejection_reason
+R02,F1,2022,,33,missing_required_field
+R01,F0,2022,100.0,20,duplicate_return_id
+R01,F0,2022,100.0,20,duplicate_return_id

@@ -189,7 +189,79 @@ for label, table in [("initial", INITIAL_TABLE), ("corrected", CORRECTED_TABLE)]
 
 # COMMAND ----------
 
-# Your checks and decision here.
+# DBTITLE 1,2a. Completeness and uniqueness checks on returns_initial
+# 2a. Completeness and uniqueness checks on returns_initial
+from pyspark.sql import functions as F
+
+REQUIRED = ["return_id", "tax_year", "income", "deduction"]
+initial_df = spark.table(INITIAL_TABLE)
+
+# Check 1: completeness — no required field may be null
+null_cond = F.expr(" OR ".join(f"{c} IS NULL" for c in REQUIRED))
+missing_df = (
+    initial_df
+    .filter(null_cond)
+    .withColumn("rejection_reason", F.lit("missing_required_field"))
+)
+
+# Check 2: uniqueness — each return_id must appear exactly once
+dup_ids = (
+    initial_df
+    .groupBy("return_id").count()
+    .filter(F.col("count") > 1)
+    .select("return_id")
+)
+dup_df = (
+    initial_df
+    .join(dup_ids, on="return_id", how="inner")
+    .withColumn("rejection_reason", F.lit("duplicate_return_id"))
+)
+
+# All affected rows kept as rejection evidence
+rejected_initial_df = missing_df.unionByName(dup_df)
+
+n_missing = missing_df.count()
+n_dup = dup_df.count()
+print(f"Completeness failures : {n_missing} row(s)")
+print(f"Uniqueness failures   : {n_dup} row(s)")
+print("\u2192 returns_initial REJECTED: fails both completeness and uniqueness checks.")
+display(rejected_initial_df.orderBy("return_id"))
+
+# COMMAND ----------
+
+# DBTITLE 1,2b. Export rejected records from returns_initial
+# 2b. Export rejected records as evidence; kept even after replacement batch succeeds
+import os
+
+os.makedirs(str(repo_root / "outputs"), exist_ok=True)
+rejected_pdf = rejected_initial_df.toPandas()
+out_path = str(repo_root / "outputs" / "initial_rejected.csv")
+rejected_pdf.to_csv(out_path, index=False)
+print(f"Saved {len(rejected_pdf)} rows \u2192 {out_path}")
+print(rejected_pdf.to_string(index=False))
+
+# COMMAND ----------
+
+# DBTITLE 1,2c. Apply same checks to returns_corrected
+# 2c. Apply the same completeness and uniqueness checks to returns_corrected
+corrected_df = spark.table(CORRECTED_TABLE)
+
+missing_corr = corrected_df.filter(null_cond)
+dup_ids_corr = (
+    corrected_df
+    .groupBy("return_id").count()
+    .filter(F.col("count") > 1)
+)
+
+n_missing_corr = missing_corr.count()
+n_dup_corr = dup_ids_corr.count()
+print(f"Completeness failures : {n_missing_corr}")
+print(f"Uniqueness failures   : {n_dup_corr}")
+
+assert n_missing_corr == 0, "returns_corrected: missing required values"
+assert n_dup_corr == 0, "returns_corrected: duplicate return_ids"
+print("\u2192 returns_corrected PASSES all checks. Using as source for feature output.")
+SOURCE_TABLE = CORRECTED_TABLE
 
 # COMMAND ----------
 
@@ -199,7 +271,74 @@ for label, table in [("initial", INITIAL_TABLE), ("corrected", CORRECTED_TABLE)]
 
 # COMMAND ----------
 
-# Your implementation and verification here.
+# DBTITLE 1,3a. Build and save return_features
+# 3a. Build deduction_to_income feature table from the accepted batch
+source_df = spark.table(SOURCE_TABLE)
+
+features_df = (
+    source_df
+    .withColumn(
+        "deduction_to_income",
+        F.when(F.col("income") == 0, F.lit(None).cast("double"))
+         .otherwise(F.col("deduction").cast("double") / F.col("income").cast("double"))
+    )
+    .select("return_id", "tax_year", "deduction_to_income")
+)
+
+(
+    features_df
+    .write
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(f"{OUTPUT_SCHEMA}.return_features")
+)
+
+n = spark.table(f"{OUTPUT_SCHEMA}.return_features").count()
+print(f"Saved {n} rows to {OUTPUT_SCHEMA}.return_features")
+display(features_df.orderBy("tax_year", "return_id"))
+
+# COMMAND ----------
+
+# DBTITLE 1,3b. Independent expected-value check
+# 3b. Independent expected-value check
+# R04 (2022) in returns_corrected: income=400, deduction=59.
+# Expected ratio derived directly from source values, without reading the saved table.
+expected_id = "R04"
+expected_ratio = 59 / 400  # 0.1475
+
+saved = spark.table(f"{OUTPUT_SCHEMA}.return_features")
+actual_row = saved.filter(F.col("return_id") == expected_id).first()
+actual_ratio = actual_row["deduction_to_income"]
+print(f"Expected {expected_id} deduction_to_income : {expected_ratio}")
+print(f"Actual   {expected_id} deduction_to_income : {actual_ratio}")
+assert abs(actual_ratio - expected_ratio) < 1e-9, f"Ratio mismatch: got {actual_ratio}"
+print("\u2713 Nonzero expected-value check passed.")
+
+# COMMAND ----------
+
+# DBTITLE 1,3c. Readback: row count, zero-income null ratio, export CSV
+# 3c. Read the saved table back; verify count and zero-income rows have null ratio
+saved = spark.table(f"{OUTPUT_SCHEMA}.return_features")
+
+row_count = saved.count()
+null_ratio_count = saved.filter(F.col("deduction_to_income").isNull()).count()
+print(f"Row count              : {row_count}  (expected 12)")
+print(f"Null-ratio rows        : {null_ratio_count}  (expected 2 \u2014 R03 2022, R09 2024)")
+
+assert row_count == 12, f"Expected 12 rows, got {row_count}"
+assert null_ratio_count == 2, f"Expected 2 null-ratio rows, got {null_ratio_count}"
+
+print("\nZero-income rows (deduction_to_income must be null):")
+display(saved.filter(F.col("deduction_to_income").isNull()).orderBy("return_id"))
+
+print("\nFull feature table:")
+display(saved.orderBy("tax_year", "return_id"))
+
+# Export for outputs/
+out_csv = str(repo_root / "outputs" / "return_features.csv")
+saved.orderBy("tax_year", "return_id").toPandas().to_csv(out_csv, index=False)
+print(f"\nExported \u2192 {out_csv}")
+print("\u2713 Saved-table readback passed.")
 
 # COMMAND ----------
 
@@ -210,4 +349,110 @@ for label, table in [("initial", INITIAL_TABLE), ("corrected", CORRECTED_TABLE)]
 
 # COMMAND ----------
 
-# Your implementation, rerun comparison and exports here.
+# DBTITLE 1,4a. Save split tables and verify year assignment
+# 4a. Save features_train (2022), features_validation (2023), features_test (2024)
+saved_features = spark.table(f"{OUTPUT_SCHEMA}.return_features")
+
+splits = [("features_train", 2022), ("features_validation", 2023), ("features_test", 2024)]
+for table_name, year in splits:
+    split_df = saved_features.filter(F.col("tax_year") == year)
+    (split_df
+        .write.mode("overwrite").option("overwriteSchema", "true")
+        .saveAsTable(f"{OUTPUT_SCHEMA}.{table_name}"))
+    n = spark.table(f"{OUTPUT_SCHEMA}.{table_name}").count()
+    # Year assignment check: every row in this table must carry the correct tax_year
+    wrong = spark.table(f"{OUTPUT_SCHEMA}.{table_name}").filter(F.col("tax_year") != year).count()
+    status = "\u2713" if wrong == 0 else f"FAIL {wrong} wrong-year rows"
+    print(f"{table_name}: {n} rows, year={year} {status}")
+
+# Coverage: every accepted return in exactly one split table, none missing
+all_splits = (
+    spark.table(f"{OUTPUT_SCHEMA}.features_train")
+    .unionByName(spark.table(f"{OUTPUT_SCHEMA}.features_validation"))
+    .unionByName(spark.table(f"{OUTPUT_SCHEMA}.features_test"))
+)
+total = all_splits.count()
+distinct = all_splits.select("return_id").distinct().count()
+assert total == 12, f"Expected 12 rows across splits, got {total}"
+assert distinct == 12, f"Expected 12 distinct IDs, got {distinct}"
+print(f"\nTotal rows across splits: {total} | Distinct return_ids: {distinct}")
+print("\u2713 Every accepted return appears in exactly one split table.")
+display(all_splits.orderBy("tax_year", "return_id"))
+
+# COMMAND ----------
+
+# DBTITLE 1,4b. Export run-1 CSVs and capture run-1 snapshot
+# 4b. Export run-1 split CSVs and capture a run-1 snapshot of return_features
+import pandas as pd
+
+for table_name, fname in [
+    (f"{OUTPUT_SCHEMA}.features_train",      "features_train.csv"),
+    (f"{OUTPUT_SCHEMA}.features_validation", "features_validation.csv"),
+    (f"{OUTPUT_SCHEMA}.features_test",       "features_test.csv"),
+]:
+    out = str(repo_root / "outputs" / fname)
+    spark.table(table_name).orderBy("return_id").toPandas().to_csv(out, index=False)
+    print(f"Exported \u2192 {out}")
+
+# Full return_features snapshot: return_id, tax_year, deduction_to_income for every accepted return
+run1_pdf = (
+    spark.table(f"{OUTPUT_SCHEMA}.return_features")
+    .orderBy("return_id", "tax_year").toPandas()
+)
+run1_path = str(repo_root / "outputs" / "run1_features.csv")
+run1_pdf.to_csv(run1_path, index=False)
+print(f"\nRun-1 snapshot ({len(run1_pdf)} rows) \u2192 {run1_path}")
+print(run1_pdf.to_string(index=False))
+
+# COMMAND ----------
+
+# DBTITLE 1,4c. Run 2: re-execute pipeline and compare with run-1
+# 4c. Run 2 — re-execute from quality checks through split saves; verify idempotency
+print("=== RUN 2 ===")
+
+# Quality checks (must still pass on returns_corrected)
+assert spark.table(CORRECTED_TABLE).filter(null_cond).count() == 0, "run2: missing required values"
+assert (
+    spark.table(CORRECTED_TABLE)
+    .groupBy("return_id").count()
+    .filter(F.col("count") > 1)
+    .count()
+) == 0, "run2: duplicate return_ids"
+print("Quality checks: passed.")
+
+# Re-save return_features (overwrite)
+(spark.table(CORRECTED_TABLE)
+    .withColumn(
+        "deduction_to_income",
+        F.when(F.col("income") == 0, F.lit(None).cast("double"))
+         .otherwise(F.col("deduction").cast("double") / F.col("income").cast("double"))
+    )
+    .select("return_id", "tax_year", "deduction_to_income")
+    .write.mode("overwrite").option("overwriteSchema", "true")
+    .saveAsTable(f"{OUTPUT_SCHEMA}.return_features")
+)
+
+# Re-save split tables (overwrite)
+feats2 = spark.table(f"{OUTPUT_SCHEMA}.return_features")
+for name, yr in [("features_train", 2022), ("features_validation", 2023), ("features_test", 2024)]:
+    (feats2.filter(F.col("tax_year") == yr)
+        .write.mode("overwrite").option("overwriteSchema", "true")
+        .saveAsTable(f"{OUTPUT_SCHEMA}.{name}"))
+print("All tables re-saved (overwrite).")
+
+# Capture run-2 snapshot
+run2_pdf = (
+    spark.table(f"{OUTPUT_SCHEMA}.return_features")
+    .orderBy("return_id", "tax_year").toPandas()
+)
+run2_path = str(repo_root / "outputs" / "run2_features.csv")
+run2_pdf.to_csv(run2_path, index=False)
+print(f"Run-2 snapshot ({len(run2_pdf)} rows) \u2192 {run2_path}")
+
+# Compare: same return_ids, same tax_year, same deduction_to_income (NaN == NaN via .equals)
+match = run1_pdf.reset_index(drop=True).equals(run2_pdf.reset_index(drop=True))
+print(f"\nRun-1 vs Run-2 return_features identical: {match}")
+assert match, "Runs differ — tables were not properly overwritten"
+print(f"\u2713 Both runs: {len(run1_pdf)} rows with identical return IDs and deduction_to_income values.")
+print("\nRun-2 snapshot:")
+print(run2_pdf.to_string(index=False))
